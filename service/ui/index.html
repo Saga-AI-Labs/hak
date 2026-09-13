@@ -101,6 +101,24 @@ section{flex:1;display:flex;flex-direction:column;min-width:0;background:var(--b
 .badge.admin-op{color:var(--purple);border-color:var(--purple)}
 .badge.dm{color:#6fe3e8;border-color:#6fe3e8}
 .env .body{white-space:pre-wrap;word-break:break-word;margin-top:4px;font-size:14px}
+.env .body.md{white-space:normal}
+.env .body.md p{margin:0 0 8px}
+.env .body.md p:last-child,.env .body.md ul:last-child,.env .body.md ol:last-child,.env .body.md pre:last-child{margin-bottom:0}
+.env .body.md h1,.env .body.md h2,.env .body.md h3,.env .body.md h4{margin:10px 0 6px;font-size:14px;color:var(--acc2)}
+.env .body.md h1:first-child,.env .body.md h2:first-child,.env .body.md h3:first-child{margin-top:0}
+.env .body.md ul,.env .body.md ol{margin:0 0 8px;padding-left:22px}
+.env .body.md li{margin:2px 0}
+.env .body.md code{background:var(--panel2);border:1px solid var(--line);border-radius:4px;padding:1px 5px;font-size:12.5px;color:var(--warn)}
+.env .body.md pre{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:10px;overflow-x:auto;margin:0 0 8px}
+.env .body.md pre code{background:none;border:none;padding:0;color:var(--fg)}
+.env .body.md blockquote{border-left:3px solid var(--line);margin:0 0 8px;padding-left:10px;color:var(--dim)}
+.env .body.md table{border-collapse:collapse;margin:0 0 8px;font-size:12.5px}
+.env .body.md th,.env .body.md td{border:1px solid var(--line);padding:3px 8px;text-align:left}
+.env .body.md th{background:var(--panel2)}
+.env .body.md a{color:var(--acc)}
+.env .body.md hr{border:none;border-top:1px solid var(--line);margin:10px 0}
+.mdbar{font-size:10px;color:var(--faint);border:1px solid var(--line);border-radius:6px;padding:0 5px;cursor:pointer;margin-left:4px}
+.mdbar:hover{border-color:var(--acc);color:var(--acc)}
 .atts{margin-top:6px;display:flex;flex-wrap:wrap;gap:6px}
 .atts .att{font-size:12px;color:var(--acc);cursor:pointer;text-decoration:none;border:1px solid var(--line);border-radius:7px;padding:3px 9px;display:inline-flex;gap:6px;align-items:center}
 .atts .att:hover{border-color:var(--acc)}
@@ -219,6 +237,8 @@ aside .box{padding:0 12px 12px}
         <button class="ghost mini" id="btn-attach" title="Attach file">📎 Attach</button>
         <input type="file" id="attach-in" class="hidden" multiple>
         <button class="ghost mini" id="btn-meta" title="meta (status/handover)">⚙ Options</button>
+        <!-- body_format: un-hidden when v2/D51 is ratified and the server accepts the field -->
+        <select id="cfmt" class="hidden" title="body format (v2 draft — pending ratification)"><option value="text">text</option><option value="markdown">markdown</option></select>
       </div>
       <div id="metaextra">
         <div class="row" id="strow">
@@ -548,6 +568,68 @@ async function loadHistory(){
   $("fseq").textContent="seq "+(S.seq||"—");
   f.scrollTop=f.scrollHeight;
 }
+/* ---------- markdown (D51 draft): safe subset, no raw HTML, D43 link allowlist ----------
+   Rendering is CLIENT-side by design: the server stores bytes and never renders.
+   Any HTML in a body is escaped and shows as literal text. */
+function mdInline(s){
+  // escape first — then apply only the subset's inline constructs
+  let t=s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+  t=t.replace(/`([^`]+)`/g,(m,c)=>"<code>"+c+"</code>");
+  t=t.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g,(m,txt,url)=>{
+    return linkOrText(url,txt);
+  });
+  t=t.replace(/\*\*([^*]+)\*\*/g,"<strong>$1</strong>");
+  t=t.replace(/(^|[^*])\*([^*\n]+)\*/g,"$1<em>$2</em>");
+  t=t.replace(/~~([^~]+)~~/g,"<s>$1</s>");
+  return t;
+}
+function linkOrText(url,txt){
+  const safe=/^(https?:|git:|ssh:|file:)/i.test(url) && !/["'<>]/.test(url);  // D43 allowlist
+  if(!safe) return txt+" ("+url.replace(/&/g,"&amp;").replace(/</g,"&lt;")+")";
+  return '<a href="'+url+'" target="_blank" rel="noopener noreferrer">'+txt+"</a>";
+}
+function mdRender(src){
+  const lines=String(src||"").split(/\r?\n/);
+  let out=[],i=0,inCode=false,codeBuf=[],listType=null,para=[];
+  const flushPara=()=>{ if(para.length){ out.push("<p>"+mdInline(para.join(" "))+"</p>"); para=[]; } };
+  const closeList=()=>{ if(listType){ out.push("</"+listType+">"); listType=null; } };
+  while(i<lines.length){
+    const ln=lines[i];
+    const fence=ln.match(/^\s*```/);
+    if(fence){ 
+      if(inCode){ out.push("<pre><code>"+codeBuf.join("\n").replace(/&/g,"&amp;").replace(/</g,"&lt;")+"</code></pre>"); codeBuf=[]; inCode=false; }
+      else { flushPara(); closeList(); inCode=true; }
+      i++; continue;
+    }
+    if(inCode){ codeBuf.push(ln); i++; continue; }
+    const h=ln.match(/^(#{1,4})\s+(.*)$/);
+    if(h){ flushPara(); closeList(); const lvl=h[1].length; out.push("<h"+lvl+">"+mdInline(h[2])+"</h"+lvl+">"); i++; continue; }
+    if(/^\s*([-*_])\s*\1\s*\1[\s-*_]*$/.test(ln)){ flushPara(); closeList(); out.push("<hr>"); i++; continue; }
+    const ul=ln.match(/^\s*[-*+]\s+(.*)$/), ol=ln.match(/^\s*\d+[.)]\s+(.*)$/);
+    if(ul||ol){
+      flushPara();
+      const want=ul?"ul":"ol";
+      if(listType!==want){ closeList(); out.push("<"+want+">"); listType=want; }
+      out.push("<li>"+mdInline((ul||ol)[1])+"</li>"); i++; continue;
+    }
+    if(/^\s*>\s?(.*)$/.test(ln)){ flushPara(); closeList(); out.push("<blockquote>"+mdInline(ln.replace(/^\s*>\s?/,""))+"</blockquote>"); i++; continue; }
+    if(/^\s*\|.*\|\s*$/.test(ln) && i+1<lines.length && /^\s*\|[\s:|-]+\|\s*$/.test(lines[i+1])){
+      flushPara(); closeList();
+      const cells=(r)=>r.trim().replace(/^\||\|$/g,"").split("|").map(c=>c.trim());
+      const head=cells(ln); i+=2; const rows=[];
+      while(i<lines.length && /^\s*\|.*\|\s*$/.test(lines[i])){ rows.push(cells(lines[i])); i++; }
+      out.push("<table><thead><tr>"+head.map(c=>"<th>"+mdInline(c)+"</th>").join("")+"</tr></thead><tbody>"+
+        rows.map(r=>"<tr>"+r.map(c=>"<td>"+mdInline(c)+"</td>").join("")+"</tr>").join("")+"</tbody></table>");
+      continue;
+    }
+    if(!ln.trim()){ flushPara(); closeList(); i++; continue; }
+    para.push(ln.trim()); i++;
+  }
+  if(inCode) out.push("<pre><code>"+codeBuf.join("\n").replace(/&/g,"&amp;").replace(/</g,"&lt;")+"</code></pre>");
+  flushPara(); closeList();
+  return out.join("");
+}
+
 /* ---------- unified guarded append: ONE entry point for rendering any
    envelope into the live feed (send path, poller, history all funnel here).
    S.map is the single dedupe authority — an id already rendered is never
@@ -899,6 +981,7 @@ $("csend").onclick=async()=>{
   let body=$("cbody").value;
   if(type==="retraction"&&!replyTarget){toast("retraction needs a reply target (D37)","err");return}
   const payload={type,body};
+  if($("cfmt")&&!$("cfmt").classList.contains("hidden")&&$("cfmt").value==="markdown")payload.body_format="markdown";
   const cmid="web-"+S.seat+"-"+Date.now();
   payload.client_msg_id=cmid;
   if(replyTarget&&type!=="retraction")payload.reply_to=replyTarget.id;
