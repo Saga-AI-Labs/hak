@@ -265,7 +265,7 @@ aside .box{padding:0 12px 12px}
       </div>
       <div id="attachrow"></div>
     </div>
-    <footer><span id="fseq">seq —</span><span id="fcount"></span><span class="spacer" style="flex:1"></span><span id="froomfoot"></span></footer>
+    <footer><span id="fseq">seq —</span><span id="fcount"></span><span class="spacer" style="flex:1"></span><span id="froomfoot"></span><span id="uibuild" style="color:var(--faint)">ui build 2026-09-13.2 · wake-toggle+stamp</span></footer>
   </section>
 
   <aside>
@@ -325,7 +325,7 @@ aside .box{padding:0 12px 12px}
   <div class="card">
     <h3 id="mm-title">Members</h3>
     <div id="mm-body"></div>
-    <div id="rs-section" class="hidden" style="margin-top:16px;border-top:1px solid var(--line);padding-top:12px">
+    <div id="rs-section" style="margin-top:16px;border-top:1px solid var(--line);padding-top:12px">
       <h3 style="margin:0 0 6px">Room settings</h3>
       <label class="lbl-check" style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer">
         <input type="checkbox" id="wh-enabled" style="width:auto"> Wake-hooks for this room (D50)
@@ -337,6 +337,7 @@ aside .box{padding:0 12px 12px}
       (<code>docs/wake-charter.md</code>, F15/V7).</p>
       <label>Policy text stored in the charter</label>
       <textarea id="wh-policy" rows="4" style="width:100%;font-size:12px"></textarea>
+      <p id="wh-noadmin" class="hidden" style="color:var(--faint);font-size:11.5px;margin:6px 0 0">You are not an admin of this room — settings are read-only for you.</p>
       <div class="rowbtns"><button class="primary" id="wh-save">Save</button></div>
     </div>
     <p class="err" id="mm-err"></p>
@@ -1120,7 +1121,8 @@ $("btn-members").onclick=async()=>{
     const isAdmin=admins.includes(S.seat);
     $("mm-title").textContent="Members · "+S.room+(isAdmin?" (you are admin)":"");
     const wh=(room.charter&&room.charter.wake_hooks)||{};
-    $("rs-section").classList.toggle("hidden",!isAdmin);
+    $("wh-enabled").disabled=$("wh-policy").disabled=$("wh-save").disabled=!isAdmin;
+    $("wh-noadmin").classList.toggle("hidden",isAdmin);
     $("wh-enabled").checked=!!wh.enabled;
     $("wh-policy").value=wh.policy||WAKE_DEFAULT_POLICY;
     $("wh-save").onclick=async()=>{
