@@ -324,7 +324,8 @@ Beyond v1's coordination core, the service now implements the v2 decisions
   a retraction may carry it too.
 - **Charter updates (D32's anticipated path)** — `POST /rooms/{room}/charter`, admin-only,
   emitting `charter_update`; `purpose`, `claim_policy`, `attachment_policy`, `wake_hooks`.
-  `admins` and `name` remain immutable in v2.0.
+  `admins` and `name` remain immutable in v2.0. In the UI: **Members → Room settings**
+  (visible to admins) toggles wake-hooks and holds the charter policy text.
 
 Conformance: **C19, C20, C20b, C21, C22/C25, C23, C24** (41 tests total, v1 must not regress).
 

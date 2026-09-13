@@ -325,6 +325,20 @@ aside .box{padding:0 12px 12px}
   <div class="card">
     <h3 id="mm-title">Members</h3>
     <div id="mm-body"></div>
+    <div id="rs-section" class="hidden" style="margin-top:16px;border-top:1px solid var(--line);padding-top:12px">
+      <h3 style="margin:0 0 6px">Room settings</h3>
+      <label class="lbl-check" style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer">
+        <input type="checkbox" id="wh-enabled" style="width:auto"> Wake-hooks for this room (D50)
+      </label>
+      <p style="color:var(--dim);font-size:11.5px;margin:6px 0">Enabling requires accepting the
+      woken-turn authorization charter: a turn granted because a wake arrived may
+      read/analyze/report, and must post a status naming the triggering seq — but may
+      <b>not</b> write to a shared repo, train, or push without a human decision in that turn
+      (<code>docs/wake-charter.md</code>, F15/V7).</p>
+      <label>Policy text stored in the charter</label>
+      <textarea id="wh-policy" rows="4" style="width:100%;font-size:12px"></textarea>
+      <div class="rowbtns"><button class="primary" id="wh-save">Save</button></div>
+    </div>
     <p class="err" id="mm-err"></p>
     <div class="rowbtns" style="margin-top:14px"><button class="ghost" onclick="closeModal('m-members')">Close</button></div>
   </div>
@@ -1094,6 +1108,8 @@ async function doRenew(id){try{const r=await POST("/v1/rooms/"+enc(S.room)+"/sco
 async function doRelease(id){try{await DEL("/v1/rooms/"+enc(S.room)+"/scopes/"+enc(id));toast("released");refreshSide()}catch(e){toast("release failed: "+e.message,"err")}}
 
 /* ---------- members modal + admin ---------- */
+const WAKE_DEFAULT_POLICY = "Woken turns (granted because a wake arrived) may read, analyze and report, and MUST post a status envelope naming the triggering seq. They may NOT write to a shared repo, launch training, or push without a human decision inside that same turn. See docs/wake-charter.md (F15/V7).";
+
 $("btn-members").onclick=async()=>{
   openModal("m-members");$("mm-err").textContent="";
   const b=$("mm-body");b.innerHTML="<p class='empty'>loading…</p>";
@@ -1103,6 +1119,25 @@ $("btn-members").onclick=async()=>{
     const admins=(room.charter&&room.charter.admins)||[];
     const isAdmin=admins.includes(S.seat);
     $("mm-title").textContent="Members · "+S.room+(isAdmin?" (you are admin)":"");
+    const wh=(room.charter&&room.charter.wake_hooks)||{};
+    $("rs-section").classList.toggle("hidden",!isAdmin);
+    $("wh-enabled").checked=!!wh.enabled;
+    $("wh-policy").value=wh.policy||WAKE_DEFAULT_POLICY;
+    $("wh-save").onclick=async()=>{
+      $("mm-err").textContent="";
+      const enabled=$("wh-enabled").checked;
+      const policy=$("wh-policy").value.trim();
+      try{
+        await POST("/v1/rooms/"+enc(S.room)+"/charter",{patch:{wake_hooks:{enabled,policy}}});
+        toast(enabled?"wake-hooks ENABLED for "+S.room+" — charter accepted":"wake-hooks disabled for "+S.room);
+        $("btn-members").onclick();
+        refreshSide();
+      }catch(e){
+        $("mm-err").textContent=e.code==="wake_charter_required"
+          ?"a policy text is required to enable wake-hooks (F15)"
+          :(e.status===403?"only admins may change the charter":e.message);
+      }
+    };
     b.textContent="";
     for(const m of mems){
       const c=el("div","card");
