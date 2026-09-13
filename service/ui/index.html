@@ -237,8 +237,7 @@ aside .box{padding:0 12px 12px}
         <button class="ghost mini" id="btn-attach" title="Attach file">📎 Attach</button>
         <input type="file" id="attach-in" class="hidden" multiple>
         <button class="ghost mini" id="btn-meta" title="meta (status/handover)">⚙ Options</button>
-        <!-- body_format: un-hidden when v2/D51 is ratified and the server accepts the field -->
-        <select id="cfmt" class="hidden" title="body format (v2 draft — pending ratification)"><option value="text">text</option><option value="markdown">markdown</option></select>
+        <select id="cfmt" title="body format (D51: server stores raw, client renders)"><option value="text">text</option><option value="markdown">markdown</option></select>
       </div>
       <div id="metaextra">
         <div class="row" id="strow">
@@ -272,6 +271,8 @@ aside .box{padding:0 12px 12px}
   <aside>
     <h3>Presence</h3><div class="box" id="membox"></div>
     <h3>Active scopes</h3><div class="box" id="scopebox"></div>
+    <h3>Assets <span id="assetcount" style="color:var(--faint)"></span></h3><div class="box" id="assetbox"></div>
+    <h3>Wake-hooks</h3><div class="box" id="subbox"></div>
   </aside>
 </main>
 
@@ -889,6 +890,42 @@ async function refreshSide(){
       sb.appendChild(c);
     }
   }catch(e){}
+  try{
+    const d=await GET("/v1/rooms/"+enc(S.room)+"/assets");
+    const ab=$("assetbox");ab.textContent="";
+    $("assetcount").textContent="("+(d.assets||[]).length+")";
+    if(!(d.assets||[]).length)ab.appendChild(el("div","empty","no assets declared"));
+    for(const a of (d.assets||[])){
+      const c=el("div","card scope-card");
+      const r1=el("div","r1");
+      r1.appendChild(el("span","res",a.asset_uri));
+      const k=el("span","knd "+a.kind,a.kind);r1.appendChild(k);c.appendChild(r1);
+      c.appendChild(el("div","sub","owner "+a.owner_seat+(a.capacity!=null?" · cap "+a.capacity:"")+(a.facts&&a.facts.fingerprint?" · "+a.facts.fingerprint:"")));
+      if(a.notes)c.appendChild(el("div","sub",a.notes));
+      ab.appendChild(c);
+    }
+    for(const al of (d.alerts||[])){
+      const w=el("div","card");
+      w.style.borderColor=al.kind==="collision"?"var(--err)":"var(--warn)";
+      w.appendChild(el("div","r1",al.kind.toUpperCase()+" · "+(al.alias||al.asset_uri)));
+      if(al.kind==="collision")w.appendChild(el("div","sub","same location+alias, fingerprints: "+(al.fingerprints||[]).join(" vs ")));
+      else w.appendChild(el("div","sub","registered but MISSING at last verify (#113 case)"));
+      ab.appendChild(w);
+    }
+  }catch(e){}
+  try{
+    const s=await GET("/v1/rooms/"+enc(S.room)+"/subscriptions");
+    const sb=$("subbox");sb.textContent="";
+    const subs=(s.subscriptions||[]);
+    if(!subs.length)sb.appendChild(el("div","empty","no wake subscriptions"));
+    for(const x of subs){
+      const c=el("div","card");
+      c.appendChild(el("div","r1",x.seat+" → "+(x.filter&&Object.keys(x.filter).length?JSON.stringify(x.filter):"any")));
+      c.appendChild(el("div","sub",x.disabled_at?("DISABLED · "+(x.disabled_reason||"")):("active · last_delivered #"+(x.last_delivered_seq??"—"))));
+      if(x.first_undelivered_seq!=null)c.appendChild(el("div","sub","first_undelivered #"+x.first_undelivered_seq));
+      sb.appendChild(c);
+    }
+  }catch(e){}
 }
 
 /* ---------- presence strip ---------- */
@@ -981,7 +1018,7 @@ $("csend").onclick=async()=>{
   let body=$("cbody").value;
   if(type==="retraction"&&!replyTarget){toast("retraction needs a reply target (D37)","err");return}
   const payload={type,body};
-  if($("cfmt")&&!$("cfmt").classList.contains("hidden")&&$("cfmt").value==="markdown")payload.body_format="markdown";
+  if($("cfmt")&&$("cfmt").value==="markdown")payload.body_format="markdown";
   const cmid="web-"+S.seat+"-"+Date.now();
   payload.client_msg_id=cmid;
   if(replyTarget&&type!=="retraction")payload.reply_to=replyTarget.id;

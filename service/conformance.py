@@ -17,6 +17,7 @@ import os
 import secrets
 import tempfile
 import threading
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -817,3 +818,295 @@ def test_dm_transparency():
     assert any(m["body"] == "psst" for m in r2.json()["messages"])
     r3 = client.get("/v1/rooms/x-dm/messages?to=pi-50", headers=hdr(t_a))
     assert any(m["body"] == "psst" for m in r3.json()["messages"])
+
+
+# ---------- v2 conformance: C19-C26 (spec rev 2, ratified V7) ----------
+
+def _enable_wake(room):
+    r = client.post(f"/v1/rooms/{room}/charter", headers=hdr(SECRET["operator"]),
+                    json={"patch": {"wake_hooks": {"enabled": True,
+                          "policy": "woken turns: read/analyze/report only; no repo writes, "
+                                    "training, or push without a human decision; status envelope "
+                                    "naming the triggering seq (F15)"}}})
+    assert r.status_code == 200, r.text
+
+
+def _b64(u):
+    import base64
+    return base64.urlsafe_b64encode(u.encode()).decode().rstrip("=")
+
+
+def test_C19_registry_crud_and_audit():
+    make_room("v2-reg")
+    t = issue_token("pi-203")["token"]
+    join_and_approve("v2-reg", "pi-203", t)
+    # non-admin cannot register
+    r = client.post("/v1/rooms/v2-reg/assets", headers=hdr(t), json={
+        "asset_uri": "gpu://rtx4090", "kind": "gpu", "capacity": 1})
+    assert r.status_code == 403
+    # admin registers
+    r = client.post("/v1/rooms/v2-reg/assets", headers=hdr(SECRET["operator"]), json={
+        "asset_uri": "gpu://rtx4090", "kind": "gpu", "capacity": 1,
+        "access": [{"seat": "pi-203", "level": "use"}],
+        "facts": {"model": "RTX 4090", "vram_gb": 24, "host": "host://ai"},
+        "notes": "single unit, exclusive"})
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["kind"] == "gpu" and body["capacity"] == 1 and body["asset_seq"] == 1
+    # idempotent re-register with identical facts -> 200
+    r2 = client.post("/v1/rooms/v2-reg/assets", headers=hdr(SECRET["operator"]), json={
+        "asset_uri": "gpu://rtx4090", "kind": "gpu", "capacity": 1,
+        "access": [{"seat": "pi-203", "level": "use"}],
+        "facts": {"model": "RTX 4090", "vram_gb": 24, "host": "host://ai"},
+        "notes": "single unit, exclusive"})
+    assert r2.status_code == 200 and r2.json()["asset_seq"] == 1
+    # conflicting facts -> 409
+    r3 = client.post("/v1/rooms/v2-reg/assets", headers=hdr(SECRET["operator"]), json={
+        "asset_uri": "gpu://rtx4090", "kind": "gpu", "capacity": 1, "facts": {"model": "A100"}})
+    assert r3.status_code == 409 and err_code(r3) == "asset_conflict"
+    # member can list; audit envelope exists
+    rl = client.get("/v1/rooms/v2-reg/assets", headers=hdr(t))
+    assert rl.status_code == 200 and len(rl.json()["assets"]) == 1
+    with hak.db() as con:
+        env = con.execute("SELECT 1 FROM messages WHERE room='v2-reg' "
+                          "AND json_extract(meta,'$.op')='asset_register'").fetchone()
+    assert env is not None
+    # retire is a tombstone
+    rd = client.delete(f"/v1/rooms/v2-reg/assets/{_b64('gpu://rtx4090')}",
+                       headers=hdr(SECRET["operator"]))
+    assert rd.status_code == 200
+    rl2 = client.get("/v1/rooms/v2-reg/assets", headers=hdr(t))
+    assert rl2.json()["assets"] == []
+
+
+def test_C20_credential_collision_alias_key():
+    """F1: collision = same (location, alias) + different fingerprint.
+    Same location, DIFFERENT aliases is NOT a collision."""
+    make_room("v2-cred")
+    T = SECRET["operator"]
+    # two aliases at one location -> no collision
+    for alias, fp in (("github", "SHA256:aaa"), ("gx10", "SHA256:bbb")):
+        r = client.post("/v1/rooms/v2-cred/assets", headers=hdr(T), json={
+            "asset_uri": f"cred://host/.ssh/{alias}", "kind": "credential",
+            "facts": {"kind": "ssh", "location": "/root/.ssh/config", "alias": alias,
+                      "fingerprint": fp, "owner": "operator"}})
+        assert r.status_code == 201, r.text
+    la = client.get("/v1/rooms/v2-cred/assets?kind=credential", headers=hdr(T)).json()
+    assert la["alerts"] == [], la["alerts"]
+    # same (location, alias), different fingerprint -> collision
+    r = client.post("/v1/rooms/v2-cred/assets", headers=hdr(T), json={
+        "asset_uri": "cred://host/.ssh/github2", "kind": "credential",
+        "facts": {"kind": "ssh", "location": "/root/.ssh/config", "alias": "github",
+                  "fingerprint": "SHA256:ccc", "owner": "pi-50"}})
+    assert r.status_code == 201
+    la2 = client.get("/v1/rooms/v2-cred/assets?kind=credential", headers=hdr(T)).json()
+    collisions = [a for a in la2["alerts"] if a["kind"] == "collision"]
+    assert len(collisions) == 1 and collisions[0]["alias"] == "github"
+    assert set(collisions[0]["fingerprints"]) == {"SHA256:aaa", "SHA256:ccc"}
+    # secret material is rejected loudly (D49.3)
+    rbad = client.post("/v1/rooms/v2-cred/assets", headers=hdr(T), json={
+        "asset_uri": "cred://host/.ssh/leaky", "kind": "credential",
+        "facts": {"fingerprint": "SHA256:x", "location": "/l", "private_key": "-----BEGIN"}})
+    assert rbad.status_code == 422 and err_code(rbad) == "credential_material_rejected"
+
+
+def test_C20b_credential_missing_state():
+    """F1/#113: destroy-by-absence. An explicit admin verify derives MISSING."""
+    make_room("v2-miss")
+    T = SECRET["operator"]
+    client.post("/v1/rooms/v2-miss/assets", headers=hdr(T), json={
+        "asset_uri": "cred://host/.ssh/alpha", "kind": "credential",
+        "facts": {"fingerprint": "SHA256:a", "location": "/l", "alias": "alpha"}})
+    client.post("/v1/rooms/v2-miss/assets", headers=hdr(T), json={
+        "asset_uri": "cred://host/.ssh/beta", "kind": "credential",
+        "facts": {"fingerprint": "SHA256:b", "location": "/l", "alias": "beta"}})
+    # verify: alpha present, beta GONE (the #113 case)
+    rv = client.post("/v1/rooms/v2-miss/assets/verify", headers=hdr(T),
+                     json={"present": ["cred://host/.ssh/alpha"], "detail": "post-rebuild scan"})
+    assert rv.status_code == 200 and rv.json()["missing"] == ["cred://host/.ssh/beta"]
+    la = client.get("/v1/rooms/v2-miss/assets?kind=credential", headers=hdr(T)).json()
+    missing = [a for a in la["alerts"] if a["kind"] == "missing"]
+    assert len(missing) == 1 and missing[0]["asset_uri"] == "cred://host/.ssh/beta"
+    # non-admin cannot verify
+    t = issue_token("pi-203")["token"]
+    join_and_approve("v2-miss", "pi-203", t)
+    assert client.post("/v1/rooms/v2-miss/assets/verify", headers=hdr(t),
+                       json={"present": []}).status_code == 403
+
+
+def test_C21_assets_scopes_and_identity():
+    """F4/F8/F3: registry anchors scope capacity; identity reuses D34;
+    path component is case-sensitive."""
+    make_room("v2-link")
+    T = SECRET["operator"]
+    t = issue_token("pi-50")["token"]
+    join_and_approve("v2-link", "pi-50", t)
+    # unregistered asset: warn-not-block (advisory, D54)
+    r0 = claim("v2-link", t, "gpu://rtx4090", "exclusive")
+    assert r0.status_code == 201
+    assert client.delete(f"/v1/rooms/v2-link/scopes/{r0.json()['scope_id']}",
+                         headers=hdr(t)).status_code == 204
+    # register capacity 1 -> single exclusive claim; second is 409 (existing D22 path)
+    client.post("/v1/rooms/v2-link/assets", headers=hdr(T), json={
+        "asset_uri": "gpu://rtx4090", "kind": "gpu", "capacity": 1})
+    t2 = issue_token("pi-203")["token"]
+    join_and_approve("v2-link", "pi-203", t2)
+    assert claim("v2-link", t, "gpu://rtx4090", "exclusive").status_code == 201
+    r2 = claim("v2-link", t2, "gpu://rtx4090", "exclusive")
+    assert r2.status_code == 409
+    # identity: case-sensitive path (F3), scheme normalized (F8)
+    client.post("/v1/rooms/v2-link/assets", headers=hdr(T), json={
+        "asset_uri": "repo://Saga-AI-Labs/hak", "kind": "repo",
+        "facts": {"remote": "https://github.com/Saga-AI-Labs/hak"}})
+    client.post("/v1/rooms/v2-link/assets", headers=hdr(T), json={
+        "asset_uri": "REPO://saga-ai-labs/hak", "kind": "repo",
+        "facts": {"remote": "https://github.com/saga-ai-labs/hak"}})
+    names = [a["asset_uri"] for a in client.get("/v1/rooms/v2-link/assets?kind=repo",
+                                                headers=hdr(T)).json()["assets"]]
+    assert "repo://Saga-AI-Labs/hak" in names and "repo://saga-ai-labs/hak" in names, names
+    # canonical file form enforced
+    rbad = client.post("/v1/rooms/v2-link/assets", headers=hdr(T), json={
+        "asset_uri": "file://tmp/x", "kind": "artifact"})
+    assert rbad.status_code == 422 and err_code(rbad) == "invalid_asset_uri"
+
+
+def test_C22_C25_wake_hooks_hardened():
+    """D50 + C22/C25: filters, metadata-only, has_attachment, self-post
+    suppression, HMAC over ts+nonce+body, disable payload names the hole."""
+    import hashlib as _h, hmac as _hmac, threading as _th
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    received = []
+    class H(BaseHTTPRequestHandler):
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(n).decode()
+            received.append((body, self.headers.get("X-HAK-Timestamp"),
+                             self.headers.get("X-HAK-Nonce"),
+                             self.headers.get("X-HAK-Signature")))
+            self.send_response(200); self.end_headers()
+        def log_message(self, *a): pass
+
+    srv = HTTPServer(("127.0.0.1", 0), H)
+    _th.Thread(target=srv.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{srv.server_port}/wake"
+
+    make_room("v2-wake")
+    _enable_wake("v2-wake")
+    t = issue_token("pi-50")["token"]
+    join_and_approve("v2-wake", "pi-50", t)
+    # wake-hooks disabled in another room -> 409
+    make_room("v2-nowake")
+    join_and_approve("v2-nowake", "pi-50", t)
+    rdis = client.post("/v1/rooms/v2-nowake/subscriptions", headers=hdr(t),
+                       json={"url": url, "filter": {}})
+    assert rdis.status_code == 409 and err_code(rdis) == "wake_hooks_disabled"
+    # subscribe on task_request
+    rsub = client.post("/v1/rooms/v2-wake/subscriptions", headers=hdr(t),
+                       json={"url": url, "filter": {"type": "task_request"}})
+    assert rsub.status_code == 201, rsub.text
+    secret = rsub.json()["secret"]
+    # a chat must NOT wake; a task_request to pi-50 MUST
+    post_msg("v2-wake", t, "just chatting")
+    assert hak.deliver_pending_wakes()["delivered"] == 0
+    rq = post_msg("v2-wake", SECRET["operator"], "work for you", type="task_request")
+    assert rq.status_code == 201
+    st = hak.deliver_pending_wakes()
+    assert st["delivered"] == 1, st
+    body, ts, nonce, sig = received[0]
+    payload = json.loads(body)
+    # metadata only: no body text, but has_attachment present (F14)
+    assert "body" not in payload and payload["has_attachment"] is False
+    assert payload["type"] == "task_request" and payload["seq"] == rq.json()["seq"]
+    # HMAC base is ts.nonce.body (F5)
+    expect = _hmac.new(secret.encode(), f"{ts}.{nonce}.{body}".encode(), _h.sha256).hexdigest()
+    assert sig == "sha256=" + expect
+    assert nonce and ts
+    # self-post never wakes (F9)
+    before = len(received)
+    post_msg("v2-wake", t, "my own request", type="task_request")
+    assert hak.deliver_pending_wakes()["delivered"] == 0
+    assert len(received) == before
+    # for_seat filter
+    rsub2 = client.post("/v1/rooms/v2-wake/subscriptions", headers=hdr(t),
+                        json={"url": url, "filter": {"for_seat": "pi-50"}})
+    assert rsub2.status_code == 201
+    post_msg("v2-wake", SECRET["operator"], "handover", type="artifact_ref",
+             meta={"kind": "handover", "for_seat": "pi-50"})
+    assert hak.deliver_pending_wakes()["delivered"] == 1
+    assert json.loads(received[-1][0])["for_seat"] == "pi-50"
+    # invalid filter key -> 422 (F7: no query language)
+    rbad = client.post("/v1/rooms/v2-wake/subscriptions", headers=hdr(t),
+                       json={"url": url, "filter": {"regex": ".*"}})
+    assert rbad.status_code == 422 and err_code(rbad) == "invalid_wake_filter"
+    # failing endpoint -> disabled after N attempts with the F10 payload
+    rsub3 = client.post("/v1/rooms/v2-wake/subscriptions", headers=hdr(t),
+                        json={"url": "http://127.0.0.1:9/dead", "filter": {"type": "review_verdict"}})
+    sub3 = rsub3.json()["sub_id"]
+    post_msg("v2-wake", SECRET["operator"], "a verdict", type="review_verdict",
+             meta={"kind": "publication"})
+    base = datetime.now(timezone.utc)
+    for i in range(hak.WAKE_MAX_ATTEMPTS + 1):
+        hak.deliver_pending_wakes(now=(base + timedelta(seconds=60 * i)).isoformat())
+    with hak.db() as con:
+        s = con.execute("SELECT * FROM subscriptions WHERE sub_id=?", (sub3,)).fetchone()
+        env = con.execute("SELECT body FROM messages WHERE room='v2-wake' "
+                          "AND json_extract(meta,'$.op')='subscription_disabled'").fetchone()
+    assert s["disabled_at"] is not None
+    assert s["first_undelivered_seq"] is not None
+    assert env is not None and "first_undelivered_seq" in env["body"]
+    srv.shutdown()
+
+
+def test_C23_publication_matrix():
+    """F16/F17/F18: the four-row D52 matrix."""
+    make_room("v2-pub")
+    t = issue_token("pi-203")["token"]
+    join_and_approve("v2-pub", "pi-203", t)
+    # unsolicited publication
+    r1 = post_msg("v2-pub", t, "standalone review", type="review_verdict",
+                  meta={"kind": "publication"})
+    assert r1.status_code == 201, r1.text
+    # solicited answer
+    req = post_msg("v2-pub", t, "please review", type="task_request")
+    r2 = post_msg("v2-pub", t, "answering", type="review_verdict", reply_to=req.json()["id"],
+                  meta={"kind": "response"})
+    assert r2.status_code == 201
+    # responds AND publishes: publication + reply_to -> 201 (F16/F17)
+    r3 = post_msg("v2-pub", t, "answer that is also an artifact", type="review_verdict",
+                  reply_to=req.json()["id"], meta={"kind": "publication"})
+    assert r3.status_code == 201, r3.text
+    # retraction carrying publication kind (F18)
+    r4 = post_msg("v2-pub", t, "retracting my finding", type="retraction",
+                  reply_to=r1.json()["id"], meta={"kind": "publication"})
+    assert r4.status_code == 201, r4.text
+    # absent/out-of-set kind -> 422
+    r5 = post_msg("v2-pub", t, "no kind", type="review_verdict")
+    assert r5.status_code == 422
+    r6 = post_msg("v2-pub", t, "bad kind", type="review_verdict", meta={"kind": "verdict"})
+    assert r6.status_code == 422
+
+
+def test_C24_body_format_and_markdown_safety():
+    """D51 + F19: stored raw, round-tripped, JCS-stable; the server never renders."""
+    make_room("v2-md")
+    t = issue_token("pi-203")["token"]
+    join_and_approve("v2-md", "pi-203", t)
+    md = "# Heading\n\n`k_sparse_ratio` and `/media/data/coding/hak` and **bold**\n\n```\nfoo_bar_baz\n```\n"
+    r = post_msg("v2-md", t, md, type="chat", body_format="markdown")
+    assert r.status_code == 201, r.text
+    got = client.get(f"/v1/rooms/v2-md/messages/{r.json()['id']}", headers=hdr(t)).json()
+    assert got["body_format"] == "markdown"
+    assert got["body"] == md                     # byte-for-byte, never rendered server-side
+    # default is text
+    r2 = post_msg("v2-md", t, "plain")
+    g2 = client.get(f"/v1/rooms/v2-md/messages/{r2.json()['id']}", headers=hdr(t)).json()
+    assert g2["body_format"] == "text"
+    # invalid format -> 422
+    r3 = post_msg("v2-md", t, "x", body_format="html")
+    assert r3.status_code == 422
+    # JCS: retry of the same markdown is idempotent (body_format is hashed)
+    r4 = post_msg("v2-md", t, md, type="chat", body_format="markdown", client_msg_id=None)
+    assert r4.status_code == 201                     # new key, new message — but hashable
+    # rendering contract is client-side; assert the hazard strings survive the API
+    assert "k_sparse_ratio" in got["body"] and "foo_bar_baz" in got["body"]

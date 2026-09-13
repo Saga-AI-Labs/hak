@@ -10,12 +10,16 @@ Bootstrap (no admin token left):  python3 hak.py --bootstrap --seat operator
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import hmac
 import json
 import os
 import re
 import secrets
 import shutil
+import urllib.error
+import urllib.request
 import sqlite3
 import sys
 import threading
@@ -69,18 +73,27 @@ DB_PATH = str(_cfg("db", "HAK_DB", os.path.join(_DATA_DEFAULT, "hak.db")))
 UPLOADS_DIR = Path(str(_cfg("uploads", "HAK_UPLOADS", os.path.join(_DATA_DEFAULT, "uploads"))))
 SCHEMA_PATH = _SERVE_DIR / "schema.sql"
 SWEEP_INTERVAL = int(_cfg("sweep_interval", "HAK_SWEEP_INTERVAL", 3600))  # 0 = off
+WAKE_POLL_SEC = int(_cfg("wake_poll_sec", "HAK_WAKE_POLL_SEC", 2))        # 0 = off (D50)
 BIND_HOST = str(_cfg("host", "HAK_HOST", "127.0.0.1"))
 BIND_PORT = int(_cfg("port", "HAK_PORT", 8890))
 
 ROOM_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}$")
 TYPES = {"chat", "status", "task_request", "task_result", "artifact_ref",
          "review_verdict", "retraction"}
-KINDS = {"status", "handover", "response", "admin-op"}
+KINDS = {"status", "handover", "response", "publication", "admin-op"}   # D52: +publication
+BODY_FORMATS = {"text", "markdown"}                                      # D51
+ASSET_KINDS = {"host", "gpu", "repo", "credential", "artifact"}          # D49
+WAKE_MAX_ATTEMPTS = 5
+WAKE_BACKOFF_SEC = 10
+WAKE_RATE_PER_MIN = 20                 # F9: per-subscription storm cap
 STATES = {"working_on", "waiting_on", "blocked", "done"}
 SCOPE_KINDS = {"write", "read-exclusive", "exclusive", "share"}
 ADMIN_OPS = {"member_approve", "member_revoke", "token_issue", "token_revoke",
              "token_revoke_all", "token_bootstrap", "room_create",
-             "charter_update", "attachment_delete"}
+             "charter_update", "attachment_delete",
+             "asset_register", "asset_update", "asset_retire", "asset_verify",
+             "subscription_created", "subscription_deleted",
+             "subscription_disabled", "wake_rate_limited"}
 MAX_BODY_BYTES = 64 * 1024            # Q8/D42
 HARD_TTL_MAX = 1440                    # D28 Fix B
 GRACE_HOURS = 24                      # D30
@@ -131,6 +144,18 @@ def init_db() -> None:
     with db() as con:
         con.executescript(SCHEMA_PATH.read_text())
         con.execute("PRAGMA journal_mode = WAL")
+        _migrate(con)
+
+
+def _migrate(con: sqlite3.Connection) -> None:
+    """In-place, additive migration (V6). v1 data is never rewritten; only new
+    columns/tables appear. Idempotent: safe on every boot.
+    Rollback note (F20): downgrading to v0.5.1 works because v1 never reads
+    `body_format`; the v1 code simply ignores it. Take a DB backup before the
+    first v2 boot anyway."""
+    cols = {r[1] for r in con.execute("PRAGMA table_info(messages)")}
+    if "body_format" not in cols:                    # D51
+        con.execute("ALTER TABLE messages ADD COLUMN body_format TEXT NOT NULL DEFAULT 'text'")
 
 
 def sha256_hex(data: bytes) -> str:
@@ -287,6 +312,13 @@ class EnvelopeIn(BaseModel):
     attachments: list[Attachment] | None = None
     refs: list[Ref] | None = None
     meta: dict | None = None
+    body_format: str | None = None                   # D51: text (default) | markdown
+
+    @model_validator(mode="after")
+    def _check_body_format(self):
+        if self.body_format is not None and self.body_format not in BODY_FORMATS:
+            raise ValueError("body_format must be 'text' or 'markdown'")
+        return self
 
 
 class RoomIn(BaseModel):
@@ -312,6 +344,39 @@ class ReadIn(BaseModel):
     seq: int
 
 
+class AccessIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    seat: str
+    level: str = "use"          # use | read | admin | none
+
+
+class AssetIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    asset_uri: str
+    kind: str
+    owner_seat: str | None = None
+    capacity: int | None = None
+    access: list[AccessIn] = []
+    facts: dict = {}
+    notes: str | None = None
+
+
+class AssetVerifyIn(BaseModel):
+    # C20b: explicit admin verification against the live host. The client
+    # reports which registered credentials it found; the server derives MISSING.
+    model_config = ConfigDict(extra="forbid")
+    present: list[str] = []
+    detail: str | None = None
+
+
+class SubscriptionIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    url: str
+    filter: dict = {}
+    secret: str | None = None
+    seat: str | None = None          # admin only: subscribe on behalf of a seat
+
+
 class TokenIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -322,26 +387,38 @@ class TokenIn(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app):
-    """Startup: ensure schema; start the periodic sweeper thread (D18/D23).
-    Shutdown: stop it. The sweeper is also exposed as run.sh --sweep for manual
-    passes; both are idempotent — the sweep is the only deleter (D23)."""
+    """Startup: ensure schema; start the sweeper (D18/D23) and the wake-delivery
+    worker (D50). Shutdown: stop both. Both are idempotent and also exposed
+    synchronously for tests/ops."""
     init_db()
     stop = threading.Event()
-    th = None
+    threads = []
     if SWEEP_INTERVAL > 0:
-        def loop():
+        def sweep_loop():
             while not stop.wait(SWEEP_INTERVAL):
                 try:
                     sweep_once()
                 except Exception as e:  # never kill the service over GC
                     print(f"[hak] sweep pass failed: {e}", file=sys.stderr)
 
-        th = threading.Thread(target=loop, name="hak-sweeper", daemon=True)
-        th.start()
+        t = threading.Thread(target=sweep_loop, name="hak-sweeper", daemon=True)
+        t.start()
+        threads.append(t)
+    if WAKE_POLL_SEC > 0:
+        def wake_loop():
+            while not stop.wait(WAKE_POLL_SEC):
+                try:
+                    deliver_pending_wakes()
+                except Exception as e:  # a failed wake never kills the service
+                    print(f"[hak] wake delivery pass failed: {e}", file=sys.stderr)
+
+        t = threading.Thread(target=wake_loop, name="hak-wakes", daemon=True)
+        t.start()
+        threads.append(t)
     yield
     stop.set()
-    if th is not None:
-        th.join(timeout=5)
+    for t in threads:
+        t.join(timeout=5)
 
 
 app = FastAPI(title="HAK", version="v1", lifespan=lifespan)
@@ -554,15 +631,17 @@ def post_message(room: str, payload: EnvelopeIn, request: Request):
         mid = envelope_id(room, seq)
         con.execute(
             "INSERT INTO messages (id, room, seq, client_msg_id, idem_hash, from_seat,"
-            " backend, to_seat, type, reply_to, body, attachments, refs, meta, ts)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " backend, to_seat, type, reply_to, body, attachments, refs, meta, ts, body_format)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (mid, room, seq, payload.client_msg_id, body_hash, seat, payload.backend,
              (payload.to or {}).get("seat") if payload.to else None, payload.type,
              payload.reply_to, payload.body,
              canonicalize([a.model_dump(exclude_none=True) for a in payload.attachments]) if payload.attachments else None,
              canonicalize([r.model_dump(exclude_none=True) for r in payload.refs]) if payload.refs else None,
-             canonicalize(payload.meta) if payload.meta else None, now_iso()))
+             canonicalize(payload.meta) if payload.meta else None, now_iso(),
+             payload.body_format or "text"))
         row = con.execute("SELECT * FROM messages WHERE id=?", (mid,)).fetchone()
+        enqueue_wakes(con, room, row)      # D50: atomic with the envelope (D40 discipline)
     return envelope_out(row)
 
 
@@ -570,9 +649,17 @@ def _validate_envelope(room: str, p: EnvelopeIn, seat: str, con) -> None:
     if p.type not in TYPES:
         raise error(422, "invalid_type", f"type must be one of {sorted(TYPES)}")
     if p.type in ("task_result", "review_verdict"):
-        if not (p.meta and p.meta.get("kind") == "response"):
+        # D13 + D52 matrix: response (solicited, with reply_to) OR publication
+        # (stands alone, may also carry reply_to — F16/F17).
+        kind = (p.meta or {}).get("kind")
+        if kind == "response":
+            pass                                       # solicited answer
+        elif kind == "publication":
+            pass                                       # unsolicited and/or stand-alone (F16)
+        else:
             raise error(422, "response_marker_required",
-                        "task_result/review_verdict require meta.kind='response' (D13)")
+                        "task_result/review_verdict require meta.kind='response' (solicited) "
+                        "or 'publication' (stand-alone) — D13/D52)")
     if p.meta:
         kind = p.meta.get("kind")
         if kind not in KINDS:
@@ -630,6 +717,7 @@ def envelope_out(row: sqlite3.Row) -> dict:
         "to": {"seat": row["to_seat"]} if row["to_seat"] else None,
         "type": row["type"], "reply_to": row["reply_to"], "body": row["body"],
         "attachments": j(row["attachments"]), "refs": j(row["refs"]), "meta": j(row["meta"]),
+        "body_format": (row["body_format"] if "body_format" in row.keys() else "text") or "text",
     }
 
 
@@ -1011,6 +1099,478 @@ def revoke_token(token_id: str, request: Request):
             append_admin_envelope(con, room_row["name"], "token_revoke", row["seat"],
                                   f"Token {token_id} of {row['seat']} revoked.")
     return {"revoked": token_id}
+
+
+# ------------------------------------------------- charter update (D32 future-note, v2)
+
+CHARTER_MUTABLE = {"purpose", "claim_policy", "attachment_policy", "wake_hooks"}
+CHARTER_IMMUTABLE = {"name", "admins"}     # v2.0: admin-set changes are a separate decision
+
+
+class CharterPatchIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    patch: dict
+
+
+@app.post("/v1/rooms/{room}/charter")
+def update_charter(room: str, payload: CharterPatchIn, request: Request):
+    """D32 anticipated this: 'A future mutation endpoint MUST emit
+    admin-op: charter_update'. `admins` and `name` are immutable in v2.0."""
+    seat = require_room_admin(request, room)
+    illegal = CHARTER_IMMUTABLE & set(payload.patch)
+    if illegal:
+        raise error(422, "charter_immutable",
+                    f"{sorted(illegal)} cannot be changed by this endpoint in v2.0 (D32/D49)")
+    unknown = set(payload.patch) - CHARTER_MUTABLE - CHARTER_IMMUTABLE
+    if unknown:
+        raise error(422, "charter_unknown_keys", f"unknown charter keys: {sorted(unknown)}")
+    with write_tx() as con:
+        r = con.execute("SELECT charter FROM rooms WHERE name=?", (room,)).fetchone()
+        if r is None:
+            raise error(404, "not_found", f"Room {room} not found")
+        ch = json.loads(r["charter"])
+        for k, v in payload.patch.items():
+            if isinstance(v, dict) and isinstance(ch.get(k), dict):
+                ch[k].update(v)                      # shallow merge for policy blocks
+            else:
+                ch[k] = v
+        if ch.get("wake_hooks", {}).get("enabled") and not ch["wake_hooks"].get("policy"):
+            raise error(422, "wake_charter_required",
+                        "enabling wake-hooks requires wake_hooks.policy — the woken-turn "
+                        "authorization charter accepted by the operator (F15/V7)")
+        con.execute("UPDATE rooms SET charter=? WHERE name=?", (canonicalize(ch), room))
+        append_admin_envelope(con, room, "charter_update", seat,
+                              f"{seat} updated charter keys: {sorted(payload.patch)}.")
+    return {"name": room, "charter": ch}
+
+
+# ------------------------------------------------- wake-hooks: D50 (ratified V7)
+
+WAKE_FILTER_KEYS = {"for_seat", "type", "meta_kind", "sender"}   # F7: closed, no query language
+
+
+def _wake_enabled(con: sqlite3.Connection, room: str) -> bool:
+    """F15: wake-hooks are opt-in per room, and enabling them accepts the
+    woken-turn authorization charter (stored in the charter as the policy)."""
+    row = con.execute("SELECT charter FROM rooms WHERE name=?", (room,)).fetchone()
+    if row is None:
+        return False
+    ch = json.loads(row["charter"])
+    return bool(ch.get("wake_hooks", {}).get("enabled"))
+
+
+def _filter_matches(flt: dict, row: sqlite3.Row) -> bool:
+    if "for_seat" in flt:
+        fs = flt["for_seat"]
+        target = None
+        if row["meta"]:
+            target = (json.loads(row["meta"]) or {}).get("for_seat")
+        if fs != "*" and target != fs:
+            return False
+    if "type" in flt and row["type"] != flt["type"]:
+        return False
+    if "meta_kind" in flt:
+        mk = (json.loads(row["meta"]) or {}).get("kind") if row["meta"] else None
+        if mk != flt["meta_kind"]:
+            return False
+    if "sender" in flt and row["from_seat"] != flt["sender"]:
+        return False
+    return True
+
+
+def enqueue_wakes(con: sqlite3.Connection, room: str, row: sqlite3.Row) -> int:
+    """Queue wake notifications INSIDE the posting transaction (atomic, D40).
+    Metadata only — never the body (D50). A seat's own posts never wake itself (F9)."""
+    subs = con.execute(
+        "SELECT * FROM subscriptions WHERE room=? AND disabled_at IS NULL", (room,)).fetchall()
+    n = 0
+    for s in subs:
+        if s["seat"] == row["from_seat"]:
+            continue                                   # self-post never wakes
+        flt = json.loads(s["filter"])
+        if not _filter_matches(flt, row):
+            continue
+        meta = json.loads(row["meta"]) if row["meta"] else {}
+        has_att = bool(row["attachments"])
+        payload = {
+            "subscription_id": s["sub_id"], "room": room, "seq": row["seq"],
+            "type": row["type"], "meta_kind": meta.get("kind"),
+            "for_seat": meta.get("for_seat"), "sender": row["from_seat"],
+            "has_attachment": has_att,                   # F14
+        }
+        cur = con.execute(
+            "INSERT OR IGNORE INTO wake_queue (sub_id, room, seq, payload, next_attempt_at,"
+            " created_at) VALUES (?,?,?,?,?,?)",
+            (s["sub_id"], room, row["seq"], canonicalize(payload), now_iso(), now_iso()))
+        n += cur.rowcount
+    return n
+
+
+def _sign_wake(secret: str, ts: str, nonce: str, body: str) -> str:
+    base = f"{ts}.{nonce}.{body}".encode()               # F5: timestamp+nonce+body
+    return hmac.new(secret.encode(), base, hashlib.sha256).hexdigest()
+
+
+def deliver_pending_wakes(limit: int = 50, now: str | None = None) -> dict:
+    """Bounded-retry delivery worker. Also called synchronously by conformance
+    (with `now` advanced, the sweep-style test hook). A missed wake is never a
+    lost message — the cursor API is the source of truth."""
+    stats = {"delivered": 0, "failed": 0, "disabled": 0, "rate_limited": 0}
+    now_dt = datetime.fromisoformat(now) if now else datetime.now(timezone.utc)
+    now_s = now_dt.isoformat(timespec="milliseconds")
+    with db() as con:
+        due = con.execute(
+            "SELECT * FROM wake_queue WHERE delivered_at IS NULL AND next_attempt_at<=?"
+            " ORDER BY qid LIMIT ?", (now_s, limit)).fetchall()
+    for q in due:
+        with db() as con:
+            s = con.execute("SELECT * FROM subscriptions WHERE sub_id=?", (q["sub_id"],)).fetchone()
+            if s is None or s["disabled_at"]:
+                with write_tx() as w:
+                    w.execute("UPDATE wake_queue SET delivered_at=? WHERE qid=?",
+                              (now_s, q["qid"]))     # drop orphan
+                continue
+            # F9: per-subscription rate cap over the last minute
+            recent = con.execute(
+                "SELECT COUNT(*) c FROM wake_queue WHERE sub_id=? AND delivered_at IS NOT NULL"
+                " AND delivered_at > ?", (q["sub_id"],
+                (now_dt - timedelta(minutes=1)).isoformat(timespec="milliseconds"))
+            ).fetchone()["c"]
+            if recent >= WAKE_RATE_PER_MIN:
+                with write_tx() as w:
+                    w.execute("UPDATE wake_queue SET delivered_at=?, last_error=? WHERE qid=?",
+                              (now_s, "rate_limited", q["qid"]))
+                    append_admin_envelope(w, q["room"], "wake_rate_limited", s["seat"],
+                                          f"Wake rate cap ({WAKE_RATE_PER_MIN}/min) reached for "
+                                          f"{s['seat']}; notifications dropped (visible, not silent).")
+                stats["rate_limited"] += 1
+                continue
+        ts = now_s
+        nonce = secrets.token_hex(12)
+        body = q["payload"]
+        sig = _sign_wake(s["secret"], ts, nonce, body)
+        req = urllib.request.Request(
+            s["url"], data=body.encode(), method="POST",
+            headers={"Content-Type": "application/json", "X-HAK-Timestamp": ts,
+                     "X-HAK-Nonce": nonce, "X-HAK-Signature": "sha256=" + sig})
+        ok, err = False, None
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                ok = 200 <= resp.status < 300
+                err = None if ok else f"http {resp.status}"
+        except Exception as e:                            # noqa: BLE001 — any failure = retry
+            err = str(e)[:200]
+        with write_tx() as w:
+            if ok:
+                w.execute("UPDATE wake_queue SET delivered_at=?, last_error=NULL WHERE qid=?",
+                          (ts, q["qid"]))
+                w.execute("UPDATE subscriptions SET last_delivered_seq=?, failure_count=0 "
+                          "WHERE sub_id=?", (q["seq"], q["sub_id"]))
+                stats["delivered"] += 1
+            else:
+                attempts = q["attempts"] + 1
+                if attempts >= WAKE_MAX_ATTEMPTS:
+                    # F10: name the hole — what was missed while deaf
+                    first_missed = w.execute(
+                        "SELECT MIN(seq) m FROM wake_queue WHERE sub_id=? AND delivered_at IS NULL",
+                        (q["sub_id"],)).fetchone()["m"]
+                    w.execute("UPDATE subscriptions SET disabled_at=?, disabled_reason=?,"
+                              " failure_count=?, first_undelivered_seq=? WHERE sub_id=?",
+                              (ts, err, attempts, first_missed, q["sub_id"]))
+                    w.execute("UPDATE wake_queue SET delivered_at=?, last_error=? WHERE qid=?",
+                              (ts, "subscription disabled", q["qid"]))
+                    append_admin_envelope(
+                        w, q["room"], "subscription_disabled", s["seat"],
+                        f"Subscription for {s['seat']} disabled after {attempts} failed deliveries "
+                        f"({err}). last_delivered_seq={s['last_delivered_seq']} "
+                        f"first_undelivered_seq={first_missed} — re-enable and pull from there.")
+                    stats["disabled"] += 1
+                else:
+                    nxt = (now_dt + timedelta(seconds=WAKE_BACKOFF_SEC * attempts)).isoformat(
+                        timespec="milliseconds")
+                    w.execute("UPDATE wake_queue SET attempts=?, next_attempt_at=?, last_error=? "
+                              "WHERE qid=?", (attempts, nxt, err, q["qid"]))
+                    w.execute("UPDATE subscriptions SET failure_count=? WHERE sub_id=?",
+                              (attempts, q["sub_id"]))
+                    stats["failed"] += 1
+    return stats
+
+
+@app.post("/v1/rooms/{room}/subscriptions", status_code=201)
+def create_subscription(room: str, payload: SubscriptionIn, request: Request):
+    seat = require_room_member(request, room)[0]
+    with db() as con:
+        _require_room_exists(con, room)
+        if not _wake_enabled(con, room):
+            raise error(409, "wake_hooks_disabled",
+                        "This room has not enabled wake-hooks; enabling them accepts the "
+                        "woken-turn authorization charter (F15). Ask an admin:")
+    unknown = set(payload.filter) - WAKE_FILTER_KEYS
+    if unknown:
+        raise error(422, "invalid_wake_filter",
+                    f"filter keys must be within {sorted(WAKE_FILTER_KEYS)} (no query language, F7)")
+    target_seat = seat
+    if payload.seat and payload.seat != seat:
+        with db() as con:
+            if not is_admin(con, room, seat):
+                raise error(403, "forbidden", "only admins may subscribe on behalf of a seat")
+        target_seat = payload.seat
+    sub_id = "w_" + secrets.token_hex(6)
+    secret = payload.secret or secrets.token_urlsafe(32)
+    with write_tx() as con:
+        con.execute(
+            "INSERT INTO subscriptions (sub_id, room, seat, url, filter, secret, created_at)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (sub_id, room, target_seat, payload.url, canonicalize(payload.filter), secret,
+             now_iso()))
+        append_admin_envelope(con, room, "subscription_created", target_seat,
+                              f"{seat} created a wake subscription for {target_seat} "
+                              f"(filter {canonicalize(payload.filter)}).")
+    return {"sub_id": sub_id, "seat": target_seat, "secret": secret,
+            "note": "the secret is the HMAC key for X-HAK-Signature; store it on the consumer"}
+
+
+@app.get("/v1/rooms/{room}/subscriptions")
+def list_subscriptions(room: str, request: Request):
+    seat = require_room_member(request, room)[0]
+    with db() as con:
+        if is_admin(con, room, seat):
+            rows = con.execute("SELECT * FROM subscriptions WHERE room=? ORDER BY created_at",
+                               (room,)).fetchall()
+        else:
+            rows = con.execute("SELECT * FROM subscriptions WHERE room=? AND seat=? "
+                               "ORDER BY created_at", (room, seat)).fetchall()
+    return {"subscriptions": [
+        {"sub_id": r["sub_id"], "seat": r["seat"], "url": r["url"],
+         "filter": json.loads(r["filter"]), "created_at": r["created_at"],
+         "disabled_at": r["disabled_at"], "disabled_reason": r["disabled_reason"],
+         "last_delivered_seq": r["last_delivered_seq"],
+         "first_undelivered_seq": r["first_undelivered_seq"],
+         "failure_count": r["failure_count"]} for r in rows]}
+
+
+@app.delete("/v1/rooms/{room}/subscriptions/{sub_id}", status_code=200)
+def delete_subscription(room: str, sub_id: str, request: Request):
+    seat = require_room_member(request, room)[0]
+    with write_tx() as con:
+        s = con.execute("SELECT * FROM subscriptions WHERE room=? AND sub_id=?",
+                        (room, sub_id)).fetchone()
+        if s is None:
+            raise error(404, "not_found", "subscription not found")
+        if s["seat"] != seat and not is_admin(con, room, seat):
+            raise error(403, "forbidden", "only the owning seat or an admin may delete")
+        con.execute("DELETE FROM subscriptions WHERE sub_id=?", (sub_id,))
+        con.execute("UPDATE wake_queue SET delivered_at=?, last_error='subscription deleted' "
+                    "WHERE sub_id=? AND delivered_at IS NULL", (now_iso(), sub_id))
+        append_admin_envelope(con, room, "subscription_deleted", s["seat"],
+                              f"{seat} deleted the wake subscription for {s['seat']}.")
+    return {"deleted": sub_id}
+
+
+# ------------------------------------------------- assets: D49 registry
+
+def _norm_asset_uri(uri: str) -> str:
+    """D34 normalization, with the path component CASE-SENSITIVE (F3/F8):
+    scheme lowercased, everything after '://' byte-exact. Registry identity and
+    scope identity must agree or entries and claims drift (pi-50's probe)."""
+    if "://" not in uri:
+        raise error(422, "invalid_asset_uri", "asset_uri must be scheme://path")
+    scheme, rest = uri.split("://", 1)
+    scheme = scheme.lower()
+    if not scheme or not rest:
+        raise error(422, "invalid_asset_uri", "empty scheme or path")
+    if scheme == "file" and not rest.startswith("/"):
+        raise error(422, "invalid_asset_uri",
+                    "canonical file form is file:/// (three slashes) + absolute path (D34)")
+    return f"{scheme}://{rest}"
+
+
+def _asset_row_out(r: sqlite3.Row) -> dict:
+    return {
+        "asset_uri": r["asset_uri"], "kind": r["kind"], "owner_seat": r["owner_seat"],
+        "capacity": r["capacity"], "access": json.loads(r["access"]),
+        "facts": json.loads(r["facts"]), "notes": r["notes"],
+        "created_at": r["created_at"], "updated_at": r["updated_at"],
+        "updated_by": r["updated_by"], "asset_seq": r["asset_seq"],
+        "retired": bool(r["retired_at"]),
+    }
+
+
+def _credential_alerts(con: sqlite3.Connection, room: str) -> list[dict]:
+    """C20 + C20b, server-derived:
+    collision = same (location, alias) with DIFFERENT fingerprint (F1);
+    missing   = last explicit verify did not find a registered credential (F1/#113).
+    Same location with different aliases is NOT a collision (a healthy ssh config)."""
+    rows = con.execute(
+        "SELECT * FROM assets WHERE room=? AND kind='credential' AND retired_at IS NULL",
+        (room,)).fetchall()
+    by_key: dict[tuple, list[sqlite3.Row]] = {}
+    for r in rows:
+        f = json.loads(r["facts"])
+        key = (str(f.get("location", "")), str(f.get("alias", "")))
+        by_key.setdefault(key, []).append(r)
+    alerts: list[dict] = []
+    for (loc, alias), group in by_key.items():
+        prints = {str(json.loads(r["facts"]).get("fingerprint", "")) for r in group}
+        if len(prints) > 1:
+            alerts.append({"kind": "collision", "location": loc, "alias": alias,
+                           "fingerprints": sorted(prints),
+                           "assets": [r["asset_uri"] for r in group]})
+    for r in rows:
+        chk = con.execute(
+            "SELECT status FROM asset_checks WHERE room=? AND asset_uri=? "
+            "ORDER BY checked_at DESC LIMIT 1", (room, r["asset_uri"])).fetchone()
+        if chk is not None and chk["status"] == "missing":
+            alerts.append({"kind": "missing", "asset_uri": r["asset_uri"],
+                           "owner_seat": r["owner_seat"]})
+    return alerts
+
+
+@app.get("/v1/rooms/{room}/assets")
+def list_assets(room: str, request: Request, kind: str | None = None):
+    require_room_member(request, room)
+    with db() as con:
+        _require_room_exists(con, room)
+        q = "SELECT * FROM assets WHERE room=? AND retired_at IS NULL"
+        args: list[Any] = [room]
+        if kind:
+            q += " AND kind=?"
+            args.append(kind)
+        q += " ORDER BY kind, asset_uri"
+        rows = con.execute(q, args).fetchall()
+        alerts = _credential_alerts(con, room)
+    return {"assets": [_asset_row_out(r) for r in rows], "alerts": alerts}
+
+
+@app.post("/v1/rooms/{room}/assets", status_code=201)
+def register_asset(room: str, payload: AssetIn, request: Request):
+    seat = require_room_admin(request, room)          # V2: admins only
+    if payload.kind not in ASSET_KINDS:
+        raise error(422, "invalid_asset_kind", f"kind must be one of {sorted(ASSET_KINDS)}")
+    uri = _norm_asset_uri(payload.asset_uri)
+    owner = payload.owner_seat or seat
+    facts = dict(payload.facts)
+    if payload.kind == "credential":
+        # D49.3: facts only, never material. Reject the obvious mistakes loudly.
+        for banned in ("key", "private_key", "secret", "token", "passphrase", "password"):
+            if banned in facts:
+                raise error(422, "credential_material_rejected",
+                            f"'{banned}' is secret material; the registry stores fingerprints "
+                            "and locations only — secrets stay on the host (D49.3)")
+        if not facts.get("fingerprint") or not facts.get("location"):
+            raise error(422, "credential_facts_incomplete",
+                        "credential facts require at least 'fingerprint' and 'location' "
+                        "(and 'alias' for collision detection, C20)")
+    access = [{"seat": a.seat, "level": a.level} for a in payload.access]
+    with write_tx() as con:
+        _require_room_exists(con, room)
+        prev = con.execute("SELECT * FROM assets WHERE room=? AND asset_uri=?",
+                           (room, uri)).fetchone()
+        nxt = con.execute("SELECT COALESCE(MAX(asset_seq),0)+1 AS n FROM assets WHERE room=?",
+                          (room,)).fetchone()["n"]
+        if prev and not prev["retired_at"]:
+            if prev["kind"] != payload.kind or canonicalize(json.loads(prev["facts"])) != canonicalize(facts):
+                raise error(409, "asset_conflict",
+                            "asset exists with different kind/facts; use PATCH to update (D49)")
+            return JSONResponse(status_code=200, content=_asset_row_out(prev))  # idempotent
+        ts = now_iso()
+        con.execute(
+            "INSERT INTO assets (room, asset_uri, kind, owner_seat, capacity, access, facts,"
+            " notes, created_at, updated_at, updated_by, retired_at, asset_seq)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)"
+            " ON CONFLICT(room, asset_uri) DO UPDATE SET kind=excluded.kind,"
+            " owner_seat=excluded.owner_seat, capacity=excluded.capacity, access=excluded.access,"
+            " facts=excluded.facts, notes=excluded.notes, updated_at=excluded.updated_at,"
+            " updated_by=excluded.updated_by, retired_at=NULL",
+            (room, uri, payload.kind, owner, payload.capacity, canonicalize(access),
+             canonicalize(facts), payload.notes, ts, ts, seat, None, nxt))
+        append_admin_envelope(con, room, "asset_register", uri,
+                              f"{seat} registered {payload.kind} asset {uri} (owner {owner}).")
+        row = con.execute("SELECT * FROM assets WHERE room=? AND asset_uri=?",
+                          (room, uri)).fetchone()
+    return _asset_row_out(row)
+
+
+@app.get("/v1/rooms/{room}/assets/{asset_uri_b64}")
+def get_asset(room: str, asset_uri_b64: str, request: Request):
+    require_room_member(request, room)
+    uri = base64.urlsafe_b64decode(asset_uri_b64 + "=" * (-len(asset_uri_b64) % 4)).decode()
+    with db() as con:
+        r = con.execute("SELECT * FROM assets WHERE room=? AND asset_uri=?",
+                        (room, uri)).fetchone()
+        if r is None:
+            raise error(404, "not_found", "asset not registered")
+        claims = con.execute(
+            "SELECT * FROM scope_events WHERE room=? AND resource_uri=? ORDER BY scope_seq",
+            (room, uri)).fetchall()
+    out = _asset_row_out(r)
+    out["claim_history"] = [dict(c) for c in claims]
+    return out
+
+
+@app.patch("/v1/rooms/{room}/assets/{asset_uri_b64}")
+def update_asset(room: str, asset_uri_b64: str, payload: AssetIn, request: Request):
+    seat = require_room_admin(request, room)
+    uri = base64.urlsafe_b64decode(asset_uri_b64 + "=" * (-len(asset_uri_b64) % 4)).decode()
+    facts = dict(payload.facts)
+    access = [{"seat": a.seat, "level": a.level} for a in payload.access]
+    with write_tx() as con:
+        r = con.execute("SELECT * FROM assets WHERE room=? AND asset_uri=?",
+                        (room, uri)).fetchone()
+        if r is None or r["retired_at"]:
+            raise error(404, "not_found", "asset not registered (or retired)")
+        con.execute(
+            "UPDATE assets SET owner_seat=?, capacity=?, access=?, facts=?, notes=?,"
+            " updated_at=?, updated_by=? WHERE room=? AND asset_uri=?",
+            (payload.owner_seat or r["owner_seat"], payload.capacity, canonicalize(access),
+             canonicalize(facts), payload.notes, now_iso(), seat, room, uri))
+        append_admin_envelope(con, room, "asset_update", uri, f"{seat} updated asset {uri}.")
+        row = con.execute("SELECT * FROM assets WHERE room=? AND asset_uri=?",
+                          (room, uri)).fetchone()
+    return _asset_row_out(row)
+
+
+@app.delete("/v1/rooms/{room}/assets/{asset_uri_b64}", status_code=200)
+def retire_asset(room: str, asset_uri_b64: str, request: Request):
+    seat = require_room_admin(request, room)
+    uri = base64.urlsafe_b64decode(asset_uri_b64 + "=" * (-len(asset_uri_b64) % 4)).decode()
+    with write_tx() as con:
+        r = con.execute("SELECT * FROM assets WHERE room=? AND asset_uri=?",
+                        (room, uri)).fetchone()
+        if r is None:
+            raise error(404, "not_found", "asset not registered")
+        con.execute("UPDATE assets SET retired_at=?, updated_at=?, updated_by=? "
+                    "WHERE room=? AND asset_uri=?", (now_iso(), now_iso(), seat, room, uri))
+        append_admin_envelope(con, room, "asset_retire", uri,
+                              f"{seat} retired asset {uri} (tombstone; history preserved).")
+    return {"retired": uri}
+
+
+@app.post("/v1/rooms/{room}/assets/verify")
+def verify_assets(room: str, payload: AssetVerifyIn, request: Request):
+    """C20b: explicit admin verification (never a background probe). The admin
+    reports which registered credentials were found on the host; the server
+    records present/missing per asset and surfaces MISSING in list_assets.
+    This is the #113 case: destruction by absence, invisible to a collision check."""
+    seat = require_room_admin(request, room)
+    present = {_norm_asset_uri(u) for u in payload.present}
+    with write_tx() as con:
+        rows = con.execute(
+            "SELECT asset_uri FROM assets WHERE room=? AND kind='credential' "
+            "AND retired_at IS NULL", (room,)).fetchall()
+        missing = []
+        for r in rows:
+            status = "present" if r["asset_uri"] in present else "missing"
+            if status == "missing":
+                missing.append(r["asset_uri"])
+            con.execute(
+                "INSERT INTO asset_checks (room, asset_uri, checked_at, status, detail, checked_by)"
+                " VALUES (?,?,?,?,?,?)",
+                (room, r["asset_uri"], now_iso(), status, payload.detail, seat))
+        append_admin_envelope(con, room, "asset_verify", seat,
+                              f"{seat} verified credentials: {len(rows) - len(missing)} present, "
+                              f"{len(missing)} missing.")
+    return {"verified": len(rows), "missing": missing}
 
 
 # ------------------------------------------------- GC sweep (D18/D23/D30/D44)

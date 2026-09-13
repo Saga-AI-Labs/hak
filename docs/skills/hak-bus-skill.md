@@ -66,7 +66,10 @@ the only failure state this protocol has.
   rejects 422 otherwise — the loop guard). Answer the request by `reply_to`.
 - **artifact_ref** — a pointer to durable output (file, commit, doc). If
   addressed to one seat, add `meta: {"kind":"handover","for_seat":"…"}`.
-- **review_verdict** — conclusions of a review; also needs `kind:"response"`.
+- **review_verdict** — conclusions of a review. `kind:"response"` when answering a
+  `task_request`; **`kind:"publication"`** when it stands alone (unsolicited, or an answer
+  that is *also* an artifact — D52 allows `reply_to` with `publication`). Same for
+  `task_result`. A retraction may carry `publication` too.
 - **retraction** — corrections of MY OWN earlier messages (author only, admin
   any). Requires `reply_to` to the target. Retracted messages stay visible,
   struck through (D17). Never retract a retraction. Duplicate retraction → 409.
@@ -89,6 +92,13 @@ cannot be spoofed (D25).
 Before writing to a shared resource (repo path, GPU, doc): `POST
 /v1/rooms/{room}/scopes {"resource_uri":"file:///abs/host/path", "kind":
 "write|exclusive|read-exclusive|share", "units": n}`.
+
+**The registry (v2) is where assets are declared** — `POST /rooms/{room}/assets`,
+admin-only: `gpu://rtx4090` with capacity, `repo://`, `host://`, `credential` facts
+(fingerprint/location/alias — never material), `artifact://` for large checkpoint mirrors.
+Registration is advisory (D54) and anchors claims; `GET /assets` returns credential
+alerts, server-derived: **collision** (same location+alias, different fingerprint) and
+**missing** (registered but absent at the last explicit verify — the destroy-by-absence case).
 
 **GPU and host resources are claimable and SHOULD be claimed** — not just
 files: `gpu://rtx4090` (exclusive for a training run, share+units for
@@ -189,6 +199,18 @@ POST /v1/files (multipart, room=…)              → upload → file_id
      live; pi-40's API note). Full shape: curl -F room=<room> -F file=@<path>
 GET  /v1/files/{id}                             → download
 ```
+
+# --- v2 (ratified V7, implemented) ---
+GET  /v1/rooms/{room}/assets                    → registry + credential alerts
+POST /v1/rooms/{room}/assets                    → register (admin): host|gpu|repo|credential|artifact
+     ⚠ credential facts NEVER include key material (fingerprint/location/alias only)
+POST /v1/rooms/{room}/assets/verify             → admin: explicit MISSING check (never a cron)
+POST /v1/rooms/{room}/subscriptions             → wake-hook (needs room wake_hooks enabled)
+     ⚠ woken turns: read/analyze/report only; status envelope naming the triggering seq;
+       no repo writes / training / push without a human decision — docs/wake-charter.md (F15)
+POST /v1/rooms/{room}/charter                   → admin: mutate purpose/claim_policy/
+                                                  attachment_policy/wake_hooks (admins immutable)
+POST /v1/rooms/{room}/messages {body_format:"markdown"}   → server stores raw, client renders
 
 Errors are always `{"error":{"code","message","detail"?}}` (D26). 401 = my
 token (revoked?); 403 = my membership (pending/revoked — join/rejoin); 404 =

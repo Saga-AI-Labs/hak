@@ -108,3 +108,83 @@ CREATE TABLE IF NOT EXISTS member_state (
   last_poll    TEXT,
   PRIMARY KEY (room, seat)
 );
+
+-- ===================================================================
+-- v2 additions (D49-D54). Additive: v1 clients are unaffected.
+-- ===================================================================
+
+-- D49 Resource Registry: what exists and who may use it (advisory, D54).
+-- The registry is the third projector (messages, scopes, assets), with its
+-- own gapless per-room asset_seq. Secrets are NEVER stored here: `facts`
+-- carries fingerprints/locations/purposes only (D49.3).
+CREATE TABLE IF NOT EXISTS assets (
+  room        TEXT NOT NULL REFERENCES rooms(name),
+  asset_uri   TEXT NOT NULL,                 -- scheme://path, D34 normalization,
+                                             --   path component CASE-SENSITIVE
+  kind        TEXT NOT NULL CHECK (kind IN ('host','gpu','repo','credential','artifact')),
+  owner_seat  TEXT NOT NULL,
+  capacity    INTEGER,                       -- gpu units; NULL = not shareable/na
+  access      TEXT NOT NULL,                 -- JSON [{seat, level}] level: use|read|admin|none
+  facts       TEXT NOT NULL,                 -- JSON, kind-specific, NEVER secret material
+  notes       TEXT,
+  created_at  TEXT NOT NULL,
+  updated_at  TEXT NOT NULL,
+  updated_by  TEXT NOT NULL,
+  retired_at  TEXT,                          -- tombstone (D17 spirit): retire, don't delete
+  asset_seq   INTEGER NOT NULL,              -- gapless per room (v2 projector)
+  PRIMARY KEY (room, asset_uri),
+  UNIQUE (room, asset_seq)
+);
+CREATE INDEX IF NOT EXISTS idx_assets_kind ON assets(room, kind);
+
+-- Credential verification state (D49/C20b): a registered credential that is
+-- no longer found on its host is MISSING — the #113 destroy-by-absence case.
+-- Verification is an explicit admin action, never a background probe.
+CREATE TABLE IF NOT EXISTS asset_checks (
+  room        TEXT NOT NULL,
+  asset_uri   TEXT NOT NULL,
+  checked_at  TEXT NOT NULL,
+  status      TEXT NOT NULL CHECK (status IN ('present','missing')),
+  detail      TEXT,
+  checked_by  TEXT NOT NULL
+);
+
+-- D50 Wake-hooks: framework-level doorbells. The notification carries METADATA
+-- ONLY; the payload is always fetched via the cursor API. Notifications are
+-- queued in the same transaction as the envelope that triggers them (atomic,
+-- D40 discipline), then delivered by the worker with bounded retries.
+CREATE TABLE IF NOT EXISTS subscriptions (
+  sub_id          TEXT PRIMARY KEY,
+  room            TEXT NOT NULL REFERENCES rooms(name),
+  seat            TEXT NOT NULL,
+  url             TEXT NOT NULL,
+  filter          TEXT NOT NULL,             -- JSON {for_seat?, type?, meta_kind?, sender?}
+  secret          TEXT NOT NULL,             -- HMAC key. NOTE: the one secret the
+                                             --   bus must hold recoverable (it signs);
+                                             --   DB is the trust root, LAN-only (D49.3
+                                             --   rationale does not apply: no material
+                                             --   secret of a seat is at stake, this is
+                                             --   a per-subscription anti-spam key).
+  created_at      TEXT NOT NULL,
+  disabled_at     TEXT,
+  disabled_reason TEXT,
+  last_delivered_seq     INTEGER,
+  first_undelivered_seq  INTEGER,
+  failure_count   INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_subs_room ON subscriptions(room, seat);
+
+CREATE TABLE IF NOT EXISTS wake_queue (
+  qid            INTEGER PRIMARY KEY AUTOINCREMENT,
+  sub_id         TEXT NOT NULL,
+  room           TEXT NOT NULL,
+  seq            INTEGER NOT NULL,
+  payload        TEXT NOT NULL,              -- JSON metadata only (never the body)
+  attempts       INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at TEXT NOT NULL,
+  created_at     TEXT NOT NULL,
+  delivered_at   TEXT,
+  last_error     TEXT,
+  UNIQUE (sub_id, room, seq)                 -- dedupe: identical (room,seq) notifies once
+);
+CREATE INDEX IF NOT EXISTS idx_wake_due ON wake_queue(delivered_at, next_attempt_at);
