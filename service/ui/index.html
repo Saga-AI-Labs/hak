@@ -215,7 +215,7 @@ aside .box{padding:0 12px 12px}
   <section>
     <div class="roomhead">
       <h2 id="rname">—</h2><span class="sub" id="rcharter"></span>
-      <button class="ghost mini" id="btn-members">Members</button>
+      <button class="ghost mini" id="btn-members" title="members, admin actions, room settings">Members</button>
       <button class="ghost mini" id="btn-claims">Claims</button>
     </div>
     <div id="strip"></div>
@@ -265,7 +265,7 @@ aside .box{padding:0 12px 12px}
       </div>
       <div id="attachrow"></div>
     </div>
-    <footer><span id="fseq">seq —</span><span id="fcount"></span><span class="spacer" style="flex:1"></span><span id="froomfoot"></span><span id="uibuild" style="color:var(--faint)">ui build 2026-09-13.2 · wake-toggle+stamp</span></footer>
+    <footer><span id="fseq">seq —</span><span id="fcount"></span><span class="spacer" style="flex:1"></span><span id="froomfoot"></span><span id="uibuild" style="color:var(--faint)">ui build 2026-09-13.3 · wake-path-hint</span></footer>
   </section>
 
   <aside>
@@ -326,7 +326,7 @@ aside .box{padding:0 12px 12px}
     <h3 id="mm-title">Members</h3>
     <div id="mm-body"></div>
     <div id="rs-section" style="margin-top:16px;border-top:1px solid var(--line);padding-top:12px">
-      <h3 style="margin:0 0 6px">Room settings</h3>
+      <h3 style="margin:0 0 6px" id="rs-h">Room settings</h3>
       <label class="lbl-check" style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer">
         <input type="checkbox" id="wh-enabled" style="width:auto"> Wake-hooks for this room (D50)
       </label>
@@ -929,10 +929,24 @@ async function refreshSide(){
     }
   }catch(e){}
   try{
-    const s=await GET("/v1/rooms/"+enc(S.room)+"/subscriptions");
+    const [s,room]=await Promise.all([
+      GET("/v1/rooms/"+enc(S.room)+"/subscriptions"),
+      GET("/v1/rooms/"+enc(S.room)),
+    ]);
     const sb=$("subbox");sb.textContent="";
     const subs=(s.subscriptions||[]);
-    if(!subs.length)sb.appendChild(el("div","empty","no wake subscriptions"));
+    const wh=(room.charter&&room.charter.wake_hooks)||{};
+    if(!wh.enabled){
+      sb.appendChild(el("div","empty","wake-hooks: OFF for this room"));
+      const hint=el("div","sub","enable via ");
+      const lnk=el("span","reply","Members → Room settings");
+      lnk.style.cursor="pointer";
+      lnk.onclick=()=>$("btn-members").onclick();
+      hint.appendChild(lnk);hint.appendChild(document.createTextNode(" (admins)"));
+      sb.appendChild(hint);
+    }else if(!subs.length){
+      sb.appendChild(el("div","empty","enabled · no subscriptions yet — seats register one with POST /subscriptions"));
+    }
     for(const x of subs){
       const c=el("div","card");
       c.appendChild(el("div","r1",x.seat+" → "+(x.filter&&Object.keys(x.filter).length?JSON.stringify(x.filter):"any")));
