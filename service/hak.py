@@ -1345,7 +1345,7 @@ def create_subscription(room: str, payload: SubscriptionIn, request: Request):
             (sub_id, room, target_seat, payload.url, canonicalize(payload.filter), secret,
              now_iso()))
         append_admin_envelope(con, room, "subscription_created", target_seat,
-                              f"{seat} created a wake subscription for {target_seat} "
+                              f"{seat} created wake subscription {sub_id} for {target_seat} "
                               f"(filter {canonicalize(payload.filter)}).")
     return {"sub_id": sub_id, "seat": target_seat, "secret": secret,
             "note": "the secret is the HMAC key for X-HAK-Signature; store it on the consumer"}
@@ -1384,7 +1384,8 @@ def delete_subscription(room: str, sub_id: str, request: Request):
         con.execute("UPDATE wake_queue SET delivered_at=?, last_error='subscription deleted' "
                     "WHERE sub_id=? AND delivered_at IS NULL", (now_iso(), sub_id))
         append_admin_envelope(con, room, "subscription_deleted", s["seat"],
-                              f"{seat} deleted the wake subscription for {s['seat']}.")
+                              f"{seat} deleted wake subscription {sub_id} for {s['seat']} "
+                              f"(filter {s['filter']}).")
     return {"deleted": sub_id}
 
 

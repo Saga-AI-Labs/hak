@@ -1168,3 +1168,10 @@ def test_wake_wildcard_actually_matches():
     st = hak.deliver_pending_wakes()
     assert st["failed"] == 1, st              # attempted => the wildcard matched
     client.delete(f"/v1/rooms/v2-ww/subscriptions/{sid}", headers=hdr(t))
+    # audit envelopes must name which subscription (create/delete correlation)
+    with hak.db() as con:
+        bodies = [r["body"] for r in con.execute(
+            "SELECT body FROM messages WHERE room='v2-ww' AND "
+            "json_extract(meta,'$.op') IN ('subscription_created','subscription_deleted')")]
+    assert any(sid in b for b in bodies), bodies
+    assert any("filter" in b for b in bodies), bodies
