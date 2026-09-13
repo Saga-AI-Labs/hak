@@ -1159,21 +1159,45 @@ def _wake_enabled(con: sqlite3.Connection, room: str) -> bool:
     return bool(ch.get("wake_hooks", {}).get("enabled"))
 
 
+def _wild_match(want: str, have: str | None) -> bool:
+    """'*' is the documented wildcard for EVERY filter key (empty filter == any)."""
+    return want == "*" or (have is not None and want == have)
+
+
+def _validate_wake_filter(flt: dict) -> None:
+    """Reject filter values that can never match. An unvalidated value is the
+    worst failure mode this API has: the subscription looks healthy, fires
+    never, and reports nothing. (bdh-cl #271: `type:"any"` — my own UI label
+    for an empty filter — was registered as a literal type value.)"""
+    unknown = set(flt) - WAKE_FILTER_KEYS
+    if unknown:
+        raise error(422, "invalid_wake_filter",
+                    f"filter keys must be within {sorted(WAKE_FILTER_KEYS)} — no query "
+                    "language (F7); an EMPTY filter means 'all'")
+    for k, v in flt.items():
+        if not isinstance(v, str) or not v:
+            raise error(422, "invalid_wake_filter",
+                        f"{k} must be a non-empty string or '*'")
+        if k == "type" and v != "*" and v not in TYPES:
+            raise error(422, "invalid_wake_filter",
+                        f"type must be '*' or one of {sorted(TYPES)} — 'any' is not a "
+                        "type; use an empty filter or '*' for all")
+        if k == "meta_kind" and v != "*" and v not in KINDS:
+            raise error(422, "invalid_wake_filter",
+                        f"meta_kind must be '*' or one of {sorted(KINDS)}")
+
+
 def _filter_matches(flt: dict, row: sqlite3.Row) -> bool:
-    if "for_seat" in flt:
-        fs = flt["for_seat"]
-        target = None
-        if row["meta"]:
-            target = (json.loads(row["meta"]) or {}).get("for_seat")
-        if fs != "*" and target != fs:
-            return False
-    if "type" in flt and row["type"] != flt["type"]:
+    meta = (json.loads(row["meta"]) or {}) if row["meta"] else {}
+    if "for_seat" in flt and not _wild_match(flt["for_seat"], meta.get("for_seat")):
         return False
-    if "meta_kind" in flt:
-        mk = (json.loads(row["meta"]) or {}).get("kind") if row["meta"] else None
-        if mk != flt["meta_kind"]:
-            return False
-    if "sender" in flt and row["from_seat"] != flt["sender"]:
+    if "type" in flt and not _wild_match(flt["type"], row["type"]):
+        return False
+    # NB: meta_kind="admin-op" never fires — system envelopes are appended by
+    # the service, not posted through this path (D6), so they do not wake seats.
+    if "meta_kind" in flt and not _wild_match(flt["meta_kind"], meta.get("kind")):
+        return False
+    if "sender" in flt and not _wild_match(flt["sender"], row["from_seat"]):
         return False
     return True
 
@@ -1305,10 +1329,7 @@ def create_subscription(room: str, payload: SubscriptionIn, request: Request):
             raise error(409, "wake_hooks_disabled",
                         "This room has not enabled wake-hooks; enabling them accepts the "
                         "woken-turn authorization charter (F15). Ask an admin:")
-    unknown = set(payload.filter) - WAKE_FILTER_KEYS
-    if unknown:
-        raise error(422, "invalid_wake_filter",
-                    f"filter keys must be within {sorted(WAKE_FILTER_KEYS)} (no query language, F7)")
+    _validate_wake_filter(payload.filter)          # 422 on values that could never match
     target_seat = seat
     if payload.seat and payload.seat != seat:
         with db() as con:

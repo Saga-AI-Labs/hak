@@ -39,3 +39,6 @@ pi-bridge/node_modules/
 
 data/
 *.token
+
+# local deployment config (may contain LAN addresses) — the example is what belongs in git
+service/hak.toml

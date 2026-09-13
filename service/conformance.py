@@ -1110,3 +1110,61 @@ def test_C24_body_format_and_markdown_safety():
     assert r4.status_code == 201                     # new key, new message — but hashable
     # rendering contract is client-side; assert the hazard strings survive the API
     assert "k_sparse_ratio" in got["body"] and "foo_bar_baz" in got["body"]
+
+
+def test_wake_filter_validation_and_wildcards():
+    """Regression for bdh-cl #271: `{"type":"any"}` was accepted and silently
+    never fired. Values that can never match are now a 422; '*' is a wildcard
+    for every filter key; empty filter means all."""
+    make_room("v2-wf")
+    _enable_wake("v2-wf")
+    t = issue_token("pi-203")["token"]
+    join_and_approve("v2-wf", "pi-203", t)
+    U = "http://127.0.0.1:9/nowhere"
+    # impossible values -> 422 (loud), not a subscription that never rings
+    for bad in ({"type": "any"}, {"type": "text"}, {"meta_kind": "verdict"},
+                {"sender": ""}, {"nope": "x"}, {"type": 5}):
+        r = client.post("/v1/rooms/v2-wf/subscriptions", headers=hdr(t),
+                        json={"url": U, "filter": bad})
+        assert r.status_code == 422 and err_code(r) == "invalid_wake_filter", (bad, r.status_code, r.text[:160])
+        assert "empty filter" in r.json()["error"]["message"].lower() or \
+               "wildcard" in r.json()["error"]["message"].lower() or \
+               "must be" in r.json()["error"]["message"].lower(), r.json()["error"]["message"]
+    # legal forms accepted: empty, '*', specific
+    for ok in ({}, {"type": "*"}, {"meta_kind": "publication"}, {"sender": "*"},
+               {"for_seat": "pi-203", "type": "artifact_ref"}):
+        r = client.post("/v1/rooms/v2-wf/subscriptions", headers=hdr(t),
+                        json={"url": U, "filter": ok})
+        assert r.status_code == 201, (ok, r.text[:160])
+
+
+def test_wake_wildcard_actually_matches():
+    """'*' must match, not merely validate."""
+    make_room("v2-ww")
+    _enable_wake("v2-ww")
+    t = issue_token("pi-50")["token"]
+    join_and_approve("v2-ww", "pi-50", t)
+    # wildcard type: a chat (from another seat) wakes it
+    rsub = client.post("/v1/rooms/v2-ww/subscriptions", headers=hdr(t),
+                       json={"url": "http://127.0.0.1:9/x", "filter": {"type": "*"}})
+    assert rsub.status_code == 201
+    assert client.delete(f"/v1/rooms/v2-ww/subscriptions/{rsub.json()['sub_id']}",
+                         headers=hdr(t)).status_code == 200
+    # sender wildcard + specific meta_kind
+    rsub2 = client.post("/v1/rooms/v2-ww/subscriptions", headers=hdr(t),
+                        json={"url": "http://127.0.0.1:9/x",
+                              "filter": {"sender": "*", "meta_kind": "handover"}})
+    sid = rsub2.json()["sub_id"]
+    # A wake ATTEMPT (not a successful delivery) is the observable signal here,
+    # since the test receiver is a dead port: attempt == the filter matched.
+    # pi-50's own handover must NOT wake itself (F9) -> no attempt at all.
+    post_msg("v2-ww", t, "self handover", type="artifact_ref",
+             meta={"kind": "handover", "for_seat": "pi-203"})
+    st0 = hak.deliver_pending_wakes()
+    assert st0["delivered"] == 0 and st0["failed"] == 0, st0
+    # operator's handover to pi-50: sender="*" matches, meta_kind matches -> attempt
+    post_msg("v2-ww", SECRET["operator"], "for you", type="artifact_ref",
+             meta={"kind": "handover", "for_seat": "pi-50"})
+    st = hak.deliver_pending_wakes()
+    assert st["failed"] == 1, st              # attempted => the wildcard matched
+    client.delete(f"/v1/rooms/v2-ww/subscriptions/{sid}", headers=hdr(t))

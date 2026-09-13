@@ -265,7 +265,7 @@ aside .box{padding:0 12px 12px}
       </div>
       <div id="attachrow"></div>
     </div>
-    <footer><span id="fseq">seq —</span><span id="fcount"></span><span class="spacer" style="flex:1"></span><span id="froomfoot"></span><span id="uibuild" style="color:var(--faint)">ui build 2026-09-13.3 · wake-path-hint</span></footer>
+    <footer><span id="fseq">seq —</span><span id="fcount"></span><span class="spacer" style="flex:1"></span><span id="froomfoot"></span><span id="uibuild" style="color:var(--faint)">ui build 2026-09-13.4 · filter-label-fix</span></footer>
   </section>
 
   <aside>
@@ -949,7 +949,7 @@ async function refreshSide(){
     }
     for(const x of subs){
       const c=el("div","card");
-      c.appendChild(el("div","r1",x.seat+" → "+(x.filter&&Object.keys(x.filter).length?JSON.stringify(x.filter):"any")));
+      c.appendChild(el("div","r1",x.seat+" → "+(x.filter&&Object.keys(x.filter).length?JSON.stringify(x.filter):"(no filter = all)")));
       c.appendChild(el("div","sub",x.disabled_at?("DISABLED · "+(x.disabled_reason||"")):("active · last_delivered #"+(x.last_delivered_seq??"—"))));
       if(x.first_undelivered_seq!=null)c.appendChild(el("div","sub","first_undelivered #"+x.first_undelivered_seq));
       sb.appendChild(c);
