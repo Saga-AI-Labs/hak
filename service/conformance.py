@@ -1175,3 +1175,47 @@ def test_wake_wildcard_actually_matches():
             "json_extract(meta,'$.op') IN ('subscription_created','subscription_deleted')")]
     assert any(sid in b for b in bodies), bodies
     assert any("filter" in b for b in bodies), bodies
+
+
+def test_reply_to_must_exist_and_be_in_room():
+    """Regression for the live 500 on bdh-cl: reply_to pointing at a nonexistent
+    id hit the messages.reply_to FOREIGN KEY and surfaced as an ASGI 500. A
+    schema-valid request must never 500 — it is a 422 with the id format spelled
+    out (the usual mistake is passing the seq number)."""
+    make_room("v2-rt")
+    make_room("v2-rt-other")
+    t = issue_token("pi-203")["token"]
+    join_and_approve("v2-rt", "pi-203", t)
+    join_and_approve("v2-rt-other", "pi-203", t)
+    # unknown id -> 422, never 500
+    r = post_msg("v2-rt", t, "reply to nothing", reply_to="m_v2-rt_0000000999")
+    assert r.status_code == 422, (r.status_code, r.text[:200])
+    assert err_code(r) == "reply_to_unknown"
+    assert "id_format" in r.json()["error"]["detail"]
+    # a bare seq number is rejected the same way (the actual new-seat mistake)
+    r2 = post_msg("v2-rt", t, "seq as id", reply_to="7")
+    assert r2.status_code == 422 and err_code(r2) == "reply_to_unknown"
+    # cross-room reply is rejected (id exists, wrong room)
+    other = post_msg("v2-rt-other", t, "elsewhere").json()
+    r3 = post_msg("v2-rt", t, "cross-room reply", reply_to=other["id"])
+    assert r3.status_code == 422 and err_code(r3) == "reply_to_unknown"
+    # valid same-room reply still works, for every type that takes one
+    base = post_msg("v2-rt", t, "the original").json()
+    for typ, meta in (("chat", None), ("artifact_ref", {"kind": "handover"}),
+                      ("task_result", {"kind": "response"})):
+        kw = {"reply_to": base["id"]}
+        if meta:
+            kw["meta"] = meta
+        rr = post_msg("v2-rt", t, f"{typ} reply", type=typ, **kw)
+        assert rr.status_code == 201, (typ, rr.status_code, rr.text[:200])
+    # exactly the three valid replies were stored; rejected ones left nothing
+    with hak.db() as con:
+        replies = con.execute(
+            "SELECT COUNT(*) c FROM messages WHERE room='v2-rt' AND reply_to=?",
+            (base["id"],)).fetchone()["c"]
+        dangling = con.execute(
+            "SELECT COUNT(*) c FROM messages m WHERE m.room='v2-rt' AND m.reply_to IS NOT NULL "
+            "AND NOT EXISTS (SELECT 1 FROM messages p WHERE p.id=m.reply_to AND p.room=m.room)"
+        ).fetchone()["c"]
+    assert replies == 3, replies
+    assert dangling == 0, dangling

@@ -256,6 +256,10 @@ Revocation notices (`token_revoke`) likewise carry no secrets.
   existing client_msg_id — use a NEW key for corrected content, or retract.
 - **404 on renew:** claim expired (TTL lapsed) — re-claim fresh (the old
   scope_id is dead; a new claim gets a new id).
+- **`422 reply_to_unknown`:** the id you replied to does not exist in this room.
+  `reply_to` is the envelope's **`id`** string (`m_<room>_<10-digit seq>`), never the
+  integer `seq`. Cross-room replies are rejected the same way — quote the id verbatim
+  from the message you are answering (a bare `7` or a guessed id will not resolve).
 - **Message "missing":** check filters first (`for_seat`, `meta_kind` are
   filters, not access); then re-pull since=cursor-1.
 - **Order=desc pagination:** order is PRESENTATION ONLY (D33); pages are

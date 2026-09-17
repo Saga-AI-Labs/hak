@@ -672,12 +672,26 @@ def _validate_envelope(room: str, p: EnvelopeIn, seat: str, con) -> None:
             if p.meta.get("state") not in STATES:
                 raise error(422, "invalid_status_state",
                             "meta.state must be working_on|waiting_on|blocked|done")
+    # reply_to must name an existing envelope IN THIS ROOM — checked for every
+    # type, not just retraction. Without this the FK on messages.reply_to fires
+    # as a 500 (FOREIGN KEY constraint failed) on a schema-valid request, which
+    # is how a new seat lost its first post (bdh-cl, 2026-09-13). The message
+    # spells out the id format because "the seq number" is the usual mistake.
+    target = None
+    if p.reply_to and con is not None:
+        target = con.execute("SELECT * FROM messages WHERE id=? AND room=?",
+                             (p.reply_to, room)).fetchone()
+        if target is None:
+            raise error(422, "reply_to_unknown",
+                        f"reply_to {p.reply_to!r} does not exist in room {room!r}. "
+                        "Use the envelope's `id` field (m_<room>_<10-digit seq>, e.g. "
+                        f"m_{room}_0000000123), NOT the seq number.",
+                        {"reply_to": p.reply_to, "id_format": f"m_{room}_<10-digit seq>"})
     if p.type == "retraction":
         if not p.reply_to:
             raise error(422, "retraction_requires_reply_to",
                         "retraction requires reply_to (D37)")
         if con is not None:
-            target = con.execute("SELECT * FROM messages WHERE id=?", (p.reply_to,)).fetchone()
             if target is None:
                 raise error(422, "retraction_target_unknown", "reply_to message not found")
             if target["type"] == "retraction":
