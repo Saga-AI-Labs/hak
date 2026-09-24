@@ -1199,6 +1199,12 @@ def test_reply_to_must_exist_and_be_in_room():
     other = post_msg("v2-rt-other", t, "elsewhere").json()
     r3 = post_msg("v2-rt", t, "cross-room reply", reply_to=other["id"])
     assert r3.status_code == 422 and err_code(r3) == "reply_to_unknown"
+    # empty/blank reply_to slips past a truthiness guard but names no envelope:
+    # it must 422, never trip the reply_to FK as a 500 (live 500, 2026-09-24)
+    for blank in ("", "   "):
+        rb = post_msg("v2-rt", t, "blank reply_to", reply_to=blank)
+        assert rb.status_code == 422, (repr(blank), rb.status_code, rb.text[:200])
+        assert err_code(rb) == "reply_to_empty"
     # valid same-room reply still works, for every type that takes one
     base = post_msg("v2-rt", t, "the original").json()
     for typ, meta in (("chat", None), ("artifact_ref", {"kind": "handover"}),

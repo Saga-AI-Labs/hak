@@ -675,10 +675,19 @@ def _validate_envelope(room: str, p: EnvelopeIn, seat: str, con) -> None:
     # reply_to must name an existing envelope IN THIS ROOM — checked for every
     # type, not just retraction. Without this the FK on messages.reply_to fires
     # as a 500 (FOREIGN KEY constraint failed) on a schema-valid request, which
-    # is how a new seat lost its first post (bdh-cl, 2026-09-13). The message
+    # is how a new seat lost its first post (bdh-cl, 2026-09-13). The guard is
+    # `is not None`, not truthiness: an empty/blank reply_to ("", " ") passes
+    # the pydantic model but names no envelope, so it gets its own 422 instead
+    # of slipping past the lookup and tripping the FK the same way. The message
     # spells out the id format because "the seq number" is the usual mistake.
     target = None
-    if p.reply_to and con is not None:
+    if p.reply_to is not None and con is not None:
+        if not p.reply_to.strip():
+            raise error(422, "reply_to_empty",
+                        "reply_to is empty — omit it for a top-level message, or use "
+                        "the envelope's `id` field (m_<room>_<10-digit seq>, e.g. "
+                        f"m_{room}_0000000123), NOT the seq number.",
+                        {"reply_to": p.reply_to, "id_format": f"m_{room}_<10-digit seq>"})
         target = con.execute("SELECT * FROM messages WHERE id=? AND room=?",
                              (p.reply_to, room)).fetchone()
         if target is None:
